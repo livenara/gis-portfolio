@@ -7,8 +7,8 @@ PMとしてシステム設計を理解していること、AIエージェント�
 
 **ターゲット企業**: NTT西日本・JR西日本・関西電力G・KKCシステムズ・NTTデータ関西等のGIS使う側企業
 
-**GitHub公開URL**: https://github.com/[未定]/gis-portfolio
-**公開URL**: https://gis.ekmdy.com
+**GitHub公開URL**: https://github.com/livenara/gis-portfolio
+**公開URL**: https://gis.ekmdy.com（DNS設定後）
 
 ---
 
@@ -18,12 +18,12 @@ PMとしてシステム設計を理解していること、AIエージェント�
 |---------|------|------|
 | 1. 要件定義 | 4アプリの機能要件・MCP設計 | ✅ 完了（2026-08-20） |
 | 2. 設計 | アーキテクチャ・ER図・API仕様・MCPツール仕様 | 🔄 進行中 |
-| 3. インフラ構築 | VM108 PostGIS + FastAPI + Nginx | ⬜ 未着手 |
-| 4. MCP Server実装 | GISツール定義・Claude API連携 | ⬜ 未着手 |
-| 5. フロントエンド実装 | React + MapLibre GL JS（4アプリ） | ⬜ 未着手 |
-| 6. データ投入 | サンプルデータ・GeoJSON整備 | ⬜ 未着手 |
+| 3. インフラ構築 | VM110 PostGIS + ConoHa FastAPI + Nginx | ✅ 完了（2026-08-20） |
+| 4. MCP Server実装 | GISツール定義・Claude API連携 | ✅ 完了（2026-08-20） |
+| 5. フロントエンド実装 | React + MapLibre GL JS（4アプリ） | ✅ 完了（2026-08-20） |
+| 6. データ投入 | サンプルデータ投入済み | ✅ 完了（2026-08-20） |
 | 7. ドキュメント整備 | GitHub docs/ + dev-log | ⬜ 未着手 |
-| 8. デプロイ | gis.ekmdy.com DNS設定・本番公開 | ⬜ 未着手 |
+| 8. デプロイ | gis.ekmdy.com Aレコード設定・certbot SSL | ⬜ 未着手 |
 
 ---
 
@@ -42,7 +42,7 @@ PMとしてシステム設計を理解していること、AIエージェント�
 | 2026-08-20 | バックエンド: FastAPI (Python) on VM108 |
 | 2026-08-20 | DB: PostGIS (PostgreSQL) on VM108 |
 | 2026-08-20 | AI: Claude API (claude-sonnet-4-6) + MCPスタイル設計 |
-| 2026-08-20 | ホスト: フロント=ロリポップ or Nginx/VM108、API=VM108 |
+| 2026-08-20 | ホスト: ConoHa VPS一本（Nginx静的+FastAPI proxy、既存minpaku/carcampと共存） |
 | 2026-08-20 | 4アプリ構成: /infra /hazard /road /estate |
 | 2026-08-20 | 面接対策10問（@voidwarriorchan）をポートフォリオ設計に組み込む |
 
@@ -165,20 +165,38 @@ PostgreSQL + PostGIS (VM108)
 
 ## 案件再開に必要な情報
 
-### VM108接続
-- 接続情報: `020_INFRA.md` 参照
-- PostGIS: port 5432、DB名: `gis_portfolio`
-- FastAPI起動: `uvicorn mcp-server.main:app --host 0.0.0.0 --port 8080`
+### 本番サーバー（ConoHa VPS）
+- SSH: `ssh -i ~/.ssh/id_ed25519 root@160.251.203.184`
+- アプリ: `/opt/gis-portfolio/`
+- 環境変数: `/opt/gis-portfolio/.env`（ANTHROPIC_API_KEY・DATABASE_URL）
+- フロントエンド: `/var/www/gis-portfolio/`
+- FastAPI: systemd `gis-portfolio.service`（port 8102）
+- Nginx: `/etc/nginx/sites-enabled/gis-portfolio`
 
-### DNS設定
-- `gis.ekmdy.com` → VM108 IPアドレス（ロリポップDNSで設定）
+### PostGIS（VM110 Docker）
+- コンテナ: `gis-portfolio-postgres`（port 5433）
+- ユーザー: gisuser / DB: gis_portfolio
+- ConoHaからTailscale経由: `100.82.62.10:5433`
 
-### 環境変数（.envに保存）
-- `ANTHROPIC_API_KEY` - Claude API
-- `DATABASE_URL` - PostGIS接続文字列
+### DNS設定（未完了）
+- `gis.ekmdy.com` → `160.251.203.184`（Aレコード）
+- DNS設定後: `certbot --nginx -d gis.ekmdy.com` でSSL取得
+- Nginxのssl_certificate行のコメントアウトを解除
+
+### デプロイコマンド
+```bash
+# フロントエンド更新
+cd frontend && npm run build
+scp -i ~/.ssh/id_ed25519 -r dist/* root@160.251.203.184:/var/www/gis-portfolio/
+
+# バックエンド更新
+scp -i ~/.ssh/id_ed25519 mcp-server/*.py root@160.251.203.184:/opt/gis-portfolio/app/
+scp -i ~/.ssh/id_ed25519 mcp-server/tools/*.py root@160.251.203.184:/opt/gis-portfolio/app/tools/
+ssh -i ~/.ssh/id_ed25519 root@160.251.203.184 "systemctl restart gis-portfolio"
+```
 
 ### GitHub
-- リポジトリ: 未作成（livenara アカウントで作成予定）
+- リポジトリ: https://github.com/livenara/gis-portfolio
 - `gh auth token` でOAuthトークン取得済み
 
 ---
