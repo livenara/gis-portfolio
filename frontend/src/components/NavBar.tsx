@@ -6,6 +6,7 @@ const LINKS = [
   { to: '/hazard', label: '防災' },
   { to: '/road', label: '道路' },
   { to: '/estate', label: '不動産' },
+  { to: '/tech', label: '技術解説' },
 ]
 
 export default function NavBar() {

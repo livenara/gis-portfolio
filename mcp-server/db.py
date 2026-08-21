@@ -3,7 +3,9 @@ import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://gisuser:[REDACTED]@100.82.62.10:5433/gis_portfolio")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 @contextmanager
 def get_db():
