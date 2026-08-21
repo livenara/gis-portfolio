@@ -1,7 +1,9 @@
 import os
+import json
 import time
 import anthropic
-from logger import log_operation, Timer
+from logger import log_operation, log_agent_run, Timer
+from output_validator import validate_geojson_output
 from tools.infra_tools import get_facilities, update_facility_status
 from tools.hazard_tools import get_hazard_info
 from tools.road_tools import get_road_status
@@ -10,7 +12,7 @@ from tools.estate_tools import search_properties, register_property
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 MAX_TOOL_CALLS = 10
-LOOP_THRESHOLD = 3  # 同一ツール連続でループ判定
+LOOP_THRESHOLD = 3
 TIMEOUT_SECONDS = 30
 
 TOOL_DEFINITIONS = [
@@ -148,10 +150,18 @@ def dispatch_tool(name: str, inputs: dict) -> dict:
 def run_agent(message: str, app_context: str, map_bbox: list | None, request_id: str) -> dict:
     """
     Claude API tool_use ループ。
-    - max 10 tool calls
-    - 同一ツール 3連続でループ検知・停止
-    - タイムアウト 30秒
-    返り値: {"reply": str, "geojson": dict | None}
+
+    Observability:
+      - ターンごとのClaude APIレイテンシと各ツール呼び出しレイテンシをDBに記録
+      - トークン使用量（input/output）を累積してagent_runログに記録
+      - 呼び出しシーケンス（ツール名・レイテンシ・成否）をagent_runに保存
+
+    Output Validation:
+      - AIが返したGeoJSONをコンテキスト別にスキーマ検証
+      - 不正なGeoJSONはNoneに差し替え（地図に反映させない）
+
+    Returns:
+      {"reply": str, "geojson": dict | None}
     """
     allowed_tools = CONTEXT_TOOLS.get(app_context, [])
     tools = [t for t in TOOL_DEFINITIONS if t["name"] in allowed_tools]
@@ -169,10 +179,40 @@ def run_agent(message: str, app_context: str, map_bbox: list | None, request_id:
     consecutive_same = 0
     final_geojson = None
     start = time.time()
+    total_input_tokens = 0
+    total_output_tokens = 0
+    tool_call_sequence: list[dict] = []
+
+    def finish(reply: str, geojson, success: bool, error: str | None = None) -> dict:
+        validated_geojson = geojson
+        if geojson is not None:
+            is_valid, validation_error = validate_geojson_output(geojson, app_context)
+            if not is_valid:
+                log_operation(
+                    request_id=request_id,
+                    tool_name="output_validation",
+                    input_params={"app_context": app_context},
+                    result_summary={"error": validation_error},
+                    is_success=False,
+                    duration_ms=0,
+                )
+                validated_geojson = None
+
+        log_agent_run(
+            request_id=request_id,
+            app_context=app_context,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            tool_call_sequence=tool_call_sequence,
+            total_latency_ms=int((time.time() - start) * 1000),
+            success=success,
+            error=error,
+        )
+        return {"reply": reply, "geojson": validated_geojson}
 
     while True:
         if time.time() - start > TIMEOUT_SECONDS:
-            return {"reply": "処理がタイムアウトしました。もう一度お試しください。", "geojson": None}
+            return finish("処理がタイムアウトしました。もう一度お試しください。", None, False, "timeout")
 
         timer = Timer()
         response = client.messages.create(
@@ -183,24 +223,28 @@ def run_agent(message: str, app_context: str, map_bbox: list | None, request_id:
             messages=messages,
         )
         elapsed = timer.elapsed_ms()
+        total_input_tokens += response.usage.input_tokens
+        total_output_tokens += response.usage.output_tokens
 
         log_operation(
             request_id=request_id,
             tool_name="claude_api",
             input_params={"message": message, "app_context": app_context, "turn": tool_call_count},
-            result_summary={"stop_reason": response.stop_reason, "tokens": response.usage.output_tokens},
+            result_summary={"stop_reason": response.stop_reason, "output_tokens": response.usage.output_tokens},
             is_success=True,
             duration_ms=elapsed,
         )
 
         if response.stop_reason == "end_turn":
             text = next((b.text for b in response.content if hasattr(b, "text")), "")
-            return {"reply": text, "geojson": final_geojson}
+            return finish(text, final_geojson, True)
 
         if response.stop_reason != "tool_use":
-            return {"reply": "予期しない応答が返りました。", "geojson": None}
+            return finish(
+                "予期しない応答が返りました。",
+                None, False, f"unexpected_stop_reason:{response.stop_reason}"
+            )
 
-        # tool_use ブロック処理
         tool_results = []
         messages.append({"role": "assistant", "content": response.content})
 
@@ -210,9 +254,11 @@ def run_agent(message: str, app_context: str, map_bbox: list | None, request_id:
 
             tool_call_count += 1
             if tool_call_count > MAX_TOOL_CALLS:
-                return {"reply": f"ツール呼び出し上限（{MAX_TOOL_CALLS}回）に達しました。", "geojson": final_geojson}
+                return finish(
+                    f"ツール呼び出し上限（{MAX_TOOL_CALLS}回）に達しました。",
+                    final_geojson, False, "max_tool_calls_exceeded",
+                )
 
-            # ループ検知
             if block.name == last_tool:
                 consecutive_same += 1
             else:
@@ -220,10 +266,10 @@ def run_agent(message: str, app_context: str, map_bbox: list | None, request_id:
             last_tool = block.name
 
             if consecutive_same >= LOOP_THRESHOLD:
-                return {
-                    "reply": f"同一ツール（{block.name}）が{LOOP_THRESHOLD}回連続したためループを検知し停止しました。",
-                    "geojson": final_geojson,
-                }
+                return finish(
+                    f"同一ツール（{block.name}）が{LOOP_THRESHOLD}回連続したためループを検知し停止しました。",
+                    final_geojson, False, f"loop_detected:{block.name}",
+                )
 
             t = Timer()
             try:
@@ -233,20 +279,25 @@ def run_agent(message: str, app_context: str, map_bbox: list | None, request_id:
                 result = {"error": str(e)}
                 ok = False
 
+            call_latency = t.elapsed_ms()
+            tool_call_sequence.append({
+                "name": block.name,
+                "latency_ms": call_latency,
+                "success": ok,
+            })
+
             log_operation(
                 request_id=request_id,
                 tool_name=block.name,
                 input_params=block.input,
                 result_summary={"count": result.get("count"), "success": result.get("success")},
                 is_success=ok,
-                duration_ms=t.elapsed_ms(),
+                duration_ms=call_latency,
             )
 
-            # GeoJSON があれば保持（最後のものを使用）
             if "features" in result:
                 final_geojson = result
 
-            import json
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
